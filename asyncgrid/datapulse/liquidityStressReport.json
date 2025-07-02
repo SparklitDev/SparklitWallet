@@ -1,0 +1,7 @@
+{
+  "rpcUrl": "https://api.mainnet-beta.solana.com",
+  "trackedAccounts": [],
+  "pollingIntervalMs": 60000,
+  "maxEvents": 100,
+  "thresholdLamports": 500000000
+}
