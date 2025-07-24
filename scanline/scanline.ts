@@ -1,9 +1,11 @@
 import {
   Connection,
   PublicKey,
-  ParsedConfirmedTransaction,
+  ParsedTransactionWithMeta,
   ConfirmedSignatureInfo,
+  Commitment,
 } from "@solana/web3.js"
+import { EventEmitter } from "events"
 
 /**
  * Scanline module for Sparklit Wallet
@@ -15,6 +17,7 @@ export interface ScanlineConfig {
   maxSignatures?: number
   lamportsThreshold?: number
   pollingIntervalMs?: number
+  commitment?: Commitment
 }
 
 export type TransferAlert = {
@@ -25,122 +28,113 @@ export type TransferAlert = {
   slot: number
 }
 
-export class Scanline {
+export class Scanline extends EventEmitter {
   private connection: Connection
   private walletPublicKey: PublicKey
   private maxSignatures: number
   private lamportsThreshold: number
   private pollingIntervalMs: number
-  private isActive: boolean = false
+  private commitment: Commitment
+  private isActive = false
   private lastSeenSignature: string | null = null
 
   constructor(config: ScanlineConfig) {
-    this.connection = config.connection
-    this.walletPublicKey = config.walletPublicKey
-    this.maxSignatures = config.maxSignatures ?? 100
-    this.lamportsThreshold = config.lamportsThreshold ?? 1_000_000_000 // 1 SOL
-    this.pollingIntervalMs = config.pollingIntervalMs ?? 60_000 // 1 minute
+    super()
+    const {
+      connection,
+      walletPublicKey,
+      maxSignatures = 100,
+      lamportsThreshold = 1_000_000_000, // 1 SOL
+      pollingIntervalMs = 60_000,        // 1 minute
+      commitment = "confirmed",
+    } = config
+
+    this.connection = connection
+    this.walletPublicKey = walletPublicKey
+    this.maxSignatures = maxSignatures
+    this.lamportsThreshold = lamportsThreshold
+    this.pollingIntervalMs = pollingIntervalMs
+    this.commitment = commitment
   }
 
-  /**
-   * Start the polling process
-   */
+  /** Start polling; emits 'alert' for each TransferAlert and 'error' on failures */
   public start(): void {
     if (this.isActive) return
     this.isActive = true
-    this.pollLoop()
+    this.pollLoop().catch(err => this.emit("error", err))
   }
 
-  /**
-   * Stop the polling process
-   */
+  /** Stop polling */
   public stop(): void {
     this.isActive = false
   }
 
-  /**
-   * Main polling loop
-   */
   private async pollLoop(): Promise<void> {
     while (this.isActive) {
       try {
         const alerts = await this.scanForLargeTransfers()
-        alerts.forEach(alert => this.handleAlert(alert))
-      } catch (error) {
-        console.error("Scanline error:", error)
+        for (const alert of alerts) {
+          this.emit("alert", alert)
+        }
+      } catch (err) {
+        this.emit("error", err)
       }
       await this.delay(this.pollingIntervalMs)
     }
+    this.emit("stopped")
   }
 
-  /**
-   * Scan recent transactions and detect large transfers
-   */
   private async scanForLargeTransfers(): Promise<TransferAlert[]> {
-    const signatures = await this.connection.getConfirmedSignaturesForAddress2(
+    const sigs = await this.connection.getSignaturesForAddress(
       this.walletPublicKey,
-      {
-        limit: this.maxSignatures,
-      }
+      { limit: this.maxSignatures, commitment: this.commitment }
     )
 
-    const newSignatures = this.filterNewSignatures(signatures)
+    const newSigs = this.filterNewSignatures(sigs)
     const alerts: TransferAlert[] = []
 
-    for (const info of newSignatures) {
-      const tx = await this.fetchTransaction(info)
+    for (const info of newSigs) {
+      const tx = await this.fetchTransaction(info.signature)
       if (!tx) continue
+
       const transfers = this.extractTransfers(tx)
       for (const t of transfers) {
         if (t.amountLamports >= this.lamportsThreshold) {
           alerts.push(t)
         }
       }
+
       this.lastSeenSignature = info.signature
     }
 
     return alerts
   }
 
-  /**
-   * Fetch and parse a confirmed transaction
-   */
   private async fetchTransaction(
-    info: ConfirmedSignatureInfo
-  ): Promise<ParsedConfirmedTransaction | null> {
+    signature: string
+  ): Promise<ParsedTransactionWithMeta | null> {
     try {
-      const tx = await this.connection.getParsedConfirmedTransaction(info.signature)
-      return tx
+      return await this.connection.getParsedTransaction(signature, this.commitment)
     } catch {
       return null
     }
   }
 
-  /**
-   * Extract transfer instructions from a parsed transaction
-   */
   private extractTransfers(
-    tx: ParsedConfirmedTransaction
+    tx: ParsedTransactionWithMeta
   ): TransferAlert[] {
     const alerts: TransferAlert[] = []
-    const slot = tx.slot
-    const signature = tx.transaction.signatures[0]
+    const slot = tx.slot ?? -1
+    const signature = tx.transaction.signatures[0]!
 
-    tx.meta?.preTokenBalances // ensure meta exists
-
-    const instructions = tx.transaction.message.instructions
-    for (const instr of instructions) {
+    for (const instr of tx.transaction.message.instructions) {
       if ("parsed" in instr && instr.parsed.type === "transfer") {
-        const info = instr.parsed.info
-        const amountLamports = Number(info.lamports)
-        const source = info.source as string
-        const destination = info.destination as string
-
+        const info: any = instr.parsed.info
         alerts.push({
           signature,
-          amountLamports,
-          source,
-          destination,
+          amountLamports: Number(info.lamports),
+          source: info.source,
+          destination: info.destination,
           slot,
         })
       }
@@ -149,34 +143,15 @@ export class Scanline {
     return alerts
   }
 
-  /**
-   * Filter out signatures that have already been processed
-   */
   private filterNewSignatures(
     signatures: ConfirmedSignatureInfo[]
   ): ConfirmedSignatureInfo[] {
-    if (!this.lastSeenSignature) {
-      return signatures
-    }
-    const index = signatures.findIndex(s => s.signature === this.lastSeenSignature)
-    if (index === -1) {
-      return signatures
-    }
-    return signatures.slice(0, index)
+    if (!this.lastSeenSignature) return signatures
+    const idx = signatures.findIndex(s => s.signature === this.lastSeenSignature)
+    return idx >= 0 ? signatures.slice(0, idx) : signatures
   }
 
-  /**
-   * Handle an alert (override or subscribe externally)
-   */
-  protected handleAlert(alert: TransferAlert): void {
-    console.log(
-      `⚠️ Alert: Transfer of ${alert.amountLamports} lamports detected from ${alert.source} to ${alert.destination} in slot ${alert.slot} (sig: ${alert.signature})`
-    )
-  }
-
-  /**
-   * Utility delay
-   */
+  /** Utility delay */
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
   }
