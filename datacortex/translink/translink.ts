@@ -5,12 +5,14 @@ import {
   Transaction,
   SystemProgram,
   sendAndConfirmTransaction,
+  ConfirmedTransaction,
 } from "@solana/web3.js"
 import {
   Token,
   TOKEN_PROGRAM_ID,
   AccountInfo as TokenAccountInfo,
 } from "@solana/spl-token"
+import { EventEmitter } from "events"
 
 /**
  * Configuration for Translink module
@@ -32,14 +34,15 @@ export interface TransferResult {
 }
 
 /**
- * Translink handles SOL and SPL token transfers
+ * Translink handles SOL and SPL token transfers with events
  */
-export class Translink {
+export class Translink extends EventEmitter {
   private connection: Connection
   private payer: Keypair
   private pollingIntervalMs: number
 
   constructor(config: TranslinkConfig) {
+    super()
     this.connection = config.connection
     this.payer = config.payer
     this.pollingIntervalMs = config.pollingIntervalMs ?? 30_000
@@ -47,13 +50,15 @@ export class Translink {
 
   /**
    * Send SOL to a recipient
+   * Emits 'transfer' with TransferResult
    */
   public async sendSol(
     to: PublicKey,
     amountLamports: number
   ): Promise<TransferResult> {
+    let result: TransferResult = { signature: "", slot: 0, success: false }
     try {
-      const transaction = new Transaction().add(
+      const tx = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: this.payer.publicKey,
           toPubkey: to,
@@ -62,18 +67,21 @@ export class Translink {
       )
       const signature = await sendAndConfirmTransaction(
         this.connection,
-        transaction,
+        tx,
         [this.payer]
       )
-      const { slot } = await this.connection.getConfirmedTransaction(signature)!
-      return { signature, slot, success: true }
+      const parsed = await this.fetchConfirmed(signature)
+      result = { signature, slot: parsed.slot!, success: true }
     } catch (err: any) {
-      return { signature: "", slot: 0, success: false, error: err.message }
+      result.error = err.message
     }
+    this.emit("transfer", result)
+    return result
   }
 
   /**
    * Send an SPL token to a recipient
+   * Emits 'transfer' with TransferResult
    */
   public async sendSplToken(
     mintAddress: PublicKey,
@@ -81,25 +89,25 @@ export class Translink {
     amountTokens: number,
     decimals: number
   ): Promise<TransferResult> {
+    let result: TransferResult = { signature: "", slot: 0, success: false }
     try {
-      const mint = new PublicKey(mintAddress)
       const token = new Token(
         this.connection,
-        mint,
+        mintAddress,
         TOKEN_PROGRAM_ID,
         this.payer
       )
-      const fromAccount = await token.getOrCreateAssociatedAccountInfo(
+      const fromAcct = await token.getOrCreateAssociatedAccountInfo(
         this.payer.publicKey
       )
-      const toAccount = await token.getOrCreateAssociatedAccountInfo(toOwner)
-      const amount = amountTokens * 10 ** decimals
+      const toAcct = await token.getOrCreateAssociatedAccountInfo(toOwner)
+      const amount = BigInt(amountTokens) * BigInt(10 ** decimals)
 
       const tx = new Transaction().add(
         Token.createTransferInstruction(
           TOKEN_PROGRAM_ID,
-          fromAccount.address,
-          toAccount.address,
+          fromAcct.address,
+          toAcct.address,
           this.payer.publicKey,
           [],
           amount
@@ -110,24 +118,27 @@ export class Translink {
         tx,
         [this.payer]
       )
-      const { slot } = await this.connection.getConfirmedTransaction(signature)!
-      return { signature, slot, success: true }
+      const parsed = await this.fetchConfirmed(signature)
+      result = { signature, slot: parsed.slot!, success: true }
     } catch (err: any) {
-      return { signature: "", slot: 0, success: false, error: err.message }
+      result.error = err.message
     }
+    this.emit("transfer", result)
+    return result
   }
 
   /**
-   * Poll until a signature is confirmed or timeout
+   * Poll until a signature is confirmed ('confirmed' or 'finalized') or timeout
    */
   public async waitForConfirmation(
     signature: string,
     timeoutMs: number = 60_000
   ): Promise<boolean> {
-    const start = Date.now()
-    while (Date.now() - start < timeoutMs) {
-      const result = await this.connection.getSignatureStatus(signature)
-      if (result && result.value?.confirmationStatus === "confirmed") {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const status = await this.connection.getSignatureStatus(signature)
+      const conf = status?.value?.confirmationStatus
+      if (conf === "confirmed" || conf === "finalized") {
         return true
       }
       await this.delay(this.pollingIntervalMs)
@@ -135,10 +146,19 @@ export class Translink {
     return false
   }
 
-  /**
-   * Delay helper
-   */
+  /** Helper: fetch parsed confirmed transaction for slot */
+  private async fetchConfirmed(
+    signature: string
+  ): Promise<ConfirmedTransaction> {
+    const tx = await this.connection.getTransaction(signature, {
+      commitment: "confirmed",
+    })
+    if (!tx) throw new Error("Failed to fetch confirmed transaction")
+    return tx
+  }
+
+  /** Utility delay */
   private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms))
+    return new Promise((res) => setTimeout(res, ms))
   }
 }
