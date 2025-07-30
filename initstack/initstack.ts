@@ -1,10 +1,19 @@
-import { Connection } from "@solana/web3.js"
+import { Connection, PublicKey } from "@solana/web3.js"
 import { Scanline, ScanlineConfig } from "../sparklit/scanline/scanline"
 import { Watchcore, WatchcoreConfig } from "../watchcore/watchcore"
 import { Watchapi, WatchapiConfig } from "../watchapi/watchapi"
-import { PublicKey } from "@solana/web3.js"
 
-interface InitstackConfig {
+/** Hooks for instrumentation */
+export interface InitstackHooks {
+  onBeforeStart?: (module: string) => void
+  onAfterStart?: (module: string) => void
+  onBeforeStop?: (module: string) => void
+  onAfterStop?: (module: string) => void
+  onError?: (module: string, error: Error) => void
+}
+
+/** Configuration for the full stack */
+export interface InitstackConfig {
   rpcUrl: string
   scanlineWallet: string
   watchcoreAccounts: string[]
@@ -12,6 +21,17 @@ interface InitstackConfig {
   pollingIntervalMs?: number
   scanlineThresholdLamports?: number
   watchcoreThresholdLamports?: number
+  hooks?: InitstackHooks
+}
+
+/** Simple structured logger */
+const logger = {
+  info: (msg: string, meta: any = {}) =>
+    console.log({ level: "info", timestamp: new Date().toISOString(), msg, ...meta }),
+  warn: (msg: string, meta: any = {}) =>
+    console.warn({ level: "warn", timestamp: new Date().toISOString(), msg, ...meta }),
+  error: (msg: string, meta: any = {}) =>
+    console.error({ level: "error", timestamp: new Date().toISOString(), msg, ...meta }),
 }
 
 export class Initstack {
@@ -19,98 +39,138 @@ export class Initstack {
   private scanline: Scanline
   private watchcore: Watchcore
   private watchapi: Watchapi
+  private hooks: Required<InitstackHooks>
+  private apiPort: number
 
-  constructor(private config: InitstackConfig) {
-    this.connection = new Connection(this.config.rpcUrl)
-
-    const scanConfig: ScanlineConfig = {
-      connection: this.connection,
-      walletPublicKey: new PublicKey(this.config.scanlineWallet),
-      lamportsThreshold: this.config.scanlineThresholdLamports,
-      pollingIntervalMs: this.config.pollingIntervalMs,
+  constructor(private cfg: InitstackConfig) {
+    // merge hooks with no-ops
+    this.hooks = {
+      onBeforeStart: cfg.hooks?.onBeforeStart ?? (() => {}),
+      onAfterStart:  cfg.hooks?.onAfterStart  ?? (() => {}),
+      onBeforeStop:  cfg.hooks?.onBeforeStop  ?? (() => {}),
+      onAfterStop:   cfg.hooks?.onAfterStop   ?? (() => {}),
+      onError:       cfg.hooks?.onError       ?? (() => {}),
     }
-    this.scanline = new Scanline(scanConfig)
 
-    const trackedKeys = this.config.watchcoreAccounts.map(
-      (addr) => new PublicKey(addr)
-    )
-    const coreConfig: WatchcoreConfig = {
-      connection: this.connection,
-      trackedAccounts: trackedKeys,
-      minLamportsThreshold: this.config.watchcoreThresholdLamports,
-      pollingIntervalMs: this.config.pollingIntervalMs,
-    }
-    this.watchcore = new Watchcore(coreConfig)
+    // validate required fields
+    if (!cfg.rpcUrl) throw new Error("rpcUrl is required")
+    if (!cfg.scanlineWallet) throw new Error("scanlineWallet is required")
+    if (!cfg.watchcoreAccounts?.length) throw new Error("watchcoreAccounts must include at least one address")
 
-    const apiConfig: WatchapiConfig = {
-      solanaRpcUrl: this.config.rpcUrl,
-      port: this.config.apiPort,
-      pollingIntervalMs: this.config.pollingIntervalMs,
-      maxSignaturesPerAccount: trackedKeys.length * 50,
-      minLamportsThreshold: this.config.watchcoreThresholdLamports,
+    // defaults
+    const pollingIntervalMs      = cfg.pollingIntervalMs      ?? 60_000
+    const scanlineThreshold      = cfg.scanlineThresholdLamports ?? 1_000_000_000
+    const watchcoreThreshold     = cfg.watchcoreThresholdLamports ?? 500_000_000
+    this.apiPort = cfg.apiPort ?? 3000
+
+    // initialize connection
+    this.connection = new Connection(cfg.rpcUrl, "confirmed")
+
+    // build modules
+    try {
+      const scanConfig: ScanlineConfig = {
+        connection: this.connection,
+        walletPublicKey: new PublicKey(cfg.scanlineWallet),
+        lamportsThreshold: scanlineThreshold,
+        pollingIntervalMs,
+      }
+      this.scanline = new Scanline(scanConfig)
+
+      const tracked = cfg.watchcoreAccounts.map((addr) => new PublicKey(addr))
+      const coreConfig: WatchcoreConfig = {
+        connection: this.connection,
+        trackedAccounts: tracked,
+        minLamportsThreshold: watchcoreThreshold,
+        pollingIntervalMs,
+      }
+      this.watchcore = new Watchcore(coreConfig)
+
+      const apiConfig: WatchapiConfig = {
+        solanaRpcUrl: cfg.rpcUrl,
+        port: this.apiPort,
+        pollingIntervalMs,
+        maxSignaturesPerAccount: tracked.length * 50,
+        minLamportsThreshold: watchcoreThreshold,
+      }
+      this.watchapi = new Watchapi(apiConfig)
+    } catch (err: any) {
+      logger.error("Failed to initialize modules", { error: err.message })
+      throw err
     }
-    this.watchapi = new Watchapi(apiConfig)
   }
 
-  /**
-   * Initialize all modules: scanline, watchcore, and API
-   */
+  /** Initialize and start all modules */
   public async startAll(): Promise<void> {
-    console.log("🔧 Initializing connection to", this.config.rpcUrl)
-    this.scanline.start()
-    console.log("🔍 Scanline started")
-    this.watchcore.start()
-    console.log("🔍 Watchcore started")
-    this.watchapi.start()
-    console.log(`🌐 WatchAPI listening on port ${this.config.apiPort}`)
+    for (const [name, starter] of Object.entries({
+      scanline:    () => this.scanline.start(),
+      watchcore:   () => this.watchcore.start(),
+      watchapi:    () => this.watchapi.start(),
+    })) {
+      try {
+        this.hooks.onBeforeStart(name)
+        logger.info(`Starting ${name}`, { apiPort: name === "watchapi" ? this.apiPort : undefined })
+        await starter()
+        this.hooks.onAfterStart(name)
+        logger.info(`${name} started`)
+      } catch (err: any) {
+        logger.error(`Error starting ${name}`, { error: err.message })
+        this.hooks.onError(name, err)
+        throw err
+      }
+    }
+    logger.info("All modules started")
   }
 
-  /**
-   * Stop all running modules
-   */
+  /** Stop all running modules */
   public async stopAll(): Promise<void> {
-    console.log("🚫 Stopping Scanline")
-    this.scanline.stop()
-    console.log("🚫 Stopping Watchcore")
-    this.watchcore.stop()
-    console.log("🚫 Stopping WatchAPI")
-    this.watchapi.stop()
+    for (const [name, stopper] of Object.entries({
+      scanline:  () => this.scanline.stop(),
+      watchcore: () => this.watchcore.stop(),
+      watchapi:  () => this.watchapi.stop(),
+    })) {
+      try {
+        this.hooks.onBeforeStop(name)
+        logger.info(`Stopping ${name}`)
+        await stopper()
+        this.hooks.onAfterStop(name)
+        logger.info(`${name} stopped`)
+      } catch (err: any) {
+        logger.error(`Error stopping ${name}`, { error: err.message })
+        this.hooks.onError(name, err)
+      }
+    }
+    logger.info("All modules stopped")
   }
 }
 
-/**
- * Example bootstrap using environment variables
- */
+// Example bootstrap (can be extracted to a separate script)
 async function bootstrap(): Promise<void> {
   const cfg: InitstackConfig = {
-    rpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
-    scanlineWallet: process.env.SCANLINE_WALLET || "",
-    watchcoreAccounts: (process.env.WATCHCORE_ACCOUNTS || "").split(","),
-    apiPort: Number(process.env.API_PORT) || 3000,
-    pollingIntervalMs: Number(process.env.POLL_INTERVAL) || 60000,
-    scanlineThresholdLamports: Number(process.env.SCANLINE_THRESHOLD) || 1_000_000_000,
-    watchcoreThresholdLamports: Number(process.env.WATCHCORE_THRESHOLD) || 500_000_000,
-  }
-
-  if (!cfg.scanlineWallet || cfg.watchcoreAccounts.length === 0) {
-    console.error("❌ Missing required environment configuration")
-    process.exit(1)
+    rpcUrl:                    process.env.SOLANA_RPC_URL       || "https://api.mainnet-beta.solana.com",
+    scanlineWallet:            process.env.SCANLINE_WALLET     || "",
+    watchcoreAccounts:         (process.env.WATCHCORE_ACCOUNTS  || "").split(",").filter(Boolean),
+    apiPort:                   Number(process.env.API_PORT)     || 3000,
+    pollingIntervalMs:         Number(process.env.POLL_INTERVAL)|| 60000,
+    scanlineThresholdLamports: Number(process.env.SCANLINE_THRESHOLD)|| 1_000_000_000,
+    watchcoreThresholdLamports:Number(process.env.WATCHCORE_THRESHOLD)|| 500_000_000,
+    hooks: {
+      onError: (mod, err) => console.error(`Hook error in ${mod}:`, err),
+    }
   }
 
   const stack = new Initstack(cfg)
-  await stack.startAll()
-
-  // handle graceful shutdown
-  process.on("SIGINT", async () => {
-    console.log("💤 Graceful shutdown initiated")
-    await stack.stopAll()
-    process.exit(0)
-  })
+  try {
+    await stack.startAll()
+    process.on("SIGINT", async () => {
+      logger.info("Graceful shutdown initiated")
+      await stack.stopAll()
+      process.exit(0)
+    })
+  } catch {
+    process.exit(1)
+  }
 }
 
 if (require.main === module) {
-  bootstrap().catch((err) => {
-    console.error("Initialization error:", err)
-    process.exit(1)
-  })
+  bootstrap()
 }
