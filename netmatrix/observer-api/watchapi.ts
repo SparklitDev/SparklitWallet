@@ -1,93 +1,104 @@
-
-
-import express, { Request, Response } from "express"
-import bodyParser from "body-parser"
+import express, { Request, Response, NextFunction } from "express"
+import { json } from "body-parser"
 import { PublicKey, Connection } from "@solana/web3.js"
 import { Watchcore } from "../watchcore/watchcore"
 import { TransferEvent } from "../watchcore/watchcoreUtils"
 import { formatEventForApi, EventStore } from "./watchapiUtils"
+import { z, ZodError } from "zod"
 
-/**
- * Configuration options for WatchAPI server
- */
+/** Configuration options for WatchAPI server */
 export interface WatchapiConfig {
-  port?: number
+  port: number
   solanaRpcUrl: string
-  pollingIntervalMs?: number
-  maxSignaturesPerAccount?: number
-  minLamportsThreshold?: number
+  pollingIntervalMs: number
+  maxSignaturesPerAccount: number
+  minLamportsThreshold: number
 }
 
-// in-memory store for active watchers and events
+/** Validation schemas */
+const WatchRequestSchema = z.object({
+  account: z.string().length(44, "Invalid Solana address"),
+})
+const EventsQuerySchema = z.object({
+  since: z
+    .string()
+    .optional()
+    .transform((s) => (s ? Number(s) : 0))
+    .refine((n) => !isNaN(n) && n >= 0, "since must be a non-negative number"),
+})
+
+/** Structured logger */
+const logger = {
+  info: (msg: string, meta: any = {}) =>
+    console.log({ level: "info", timestamp: new Date().toISOString(), msg, ...meta }),
+  warn: (msg: string, meta: any = {}) =>
+    console.warn({ level: "warn", timestamp: new Date().toISOString(), msg, ...meta }),
+  error: (msg: string, meta: any = {}) =>
+    console.error({ level: "error", timestamp: new Date().toISOString(), msg, ...meta }),
+}
+
+/** In-memory store for active watchers and events */
 const eventStore = new EventStore()
+const watchers = new Map<string, Watchcore>()
 
 export class Watchapi {
   private app = express()
-  private server: any
-  private watchers: Map<string, Watchcore> = new Map()
+  private server?: ReturnType<typeof this.app.listen>
   private config: WatchapiConfig
 
-  constructor(config: WatchapiConfig) {
+  constructor(config: Partial<WatchapiConfig>) {
     this.config = {
       port: config.port ?? 3000,
       solanaRpcUrl: config.solanaRpcUrl,
-      pollingIntervalMs: config.pollingIntervalMs,
-      maxSignaturesPerAccount: config.maxSignaturesPerAccount,
-      minLamportsThreshold: config.minLamportsThreshold,
+      pollingIntervalMs: config.pollingIntervalMs ?? 60_000,
+      maxSignaturesPerAccount: config.maxSignaturesPerAccount ?? 1000,
+      minLamportsThreshold: config.minLamportsThreshold ?? 0,
     }
-    this.app.use(bodyParser.json())
+    this.app.use(json())
+    this.app.use(this.errorHandler.bind(this))
     this.setupRoutes()
   }
 
-  /**
-   * Define HTTP endpoints for WatchAPI
-   */
   private setupRoutes(): void {
-    this.app.get("/status", this.handleStatus.bind(this))
-    this.app.post("/watch", this.handleStartWatch.bind(this))
-    this.app.post("/unwatch", this.handleStopWatch.bind(this))
-    this.app.get("/events", this.handleGetEvents.bind(this))
+    this.app.get("/status", this.wrap(this.handleStatus.bind(this)))
+    this.app.post("/watch", this.wrap(this.handleStartWatch.bind(this)))
+    this.app.post("/unwatch", this.wrap(this.handleStopWatch.bind(this)))
+    this.app.get("/events", this.wrap(this.handleGetEvents.bind(this)))
   }
 
-  /**
-   * Start the Express server
-   */
+  /** Start the HTTP server */
   public start(): void {
     this.server = this.app.listen(this.config.port, () => {
-      console.log(`WatchAPI listening on port ${this.config.port}`)
+      logger.info("WatchAPI listening", { port: this.config.port })
     })
   }
 
-  /**
-   * Stop the Express server and all watchers
-   */
+  /** Stop server and all watchers */
   public stop(): void {
-    this.watchers.forEach((watcher) => watcher.stop())
+    watchers.forEach((w) => w.stop())
     if (this.server) {
-      this.server.close()
+      this.server.close(() => logger.info("HTTP server closed"))
     }
   }
 
-  private handleStatus(req: Request, res: Response): void {
+  private async handleStatus(req: Request, res: Response) {
     res.json({
-      watchers: Array.from(this.watchers.keys()),
+      watchers: [...watchers.keys()],
       eventCount: eventStore.count(),
     })
   }
 
-  private async handleStartWatch(req: Request, res: Response): Promise<void> {
+  private async handleStartWatch(req: Request, res: Response) {
+    const parsed = WatchRequestSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.errors.map(e => e.message) })
+    }
+    const key = parsed.data.account
+    if (watchers.has(key)) {
+      return res.json({ message: `Already watching ${key}` })
+    }
     try {
-      const { account } = req.body
-      if (!account) {
-        res.status(400).json({ error: "Missing 'account' in request body" })
-        return
-      }
-      const key = account as string
-      if (this.watchers.has(key)) {
-        res.json({ message: `Already watching ${key}` })
-        return
-      }
-      const connection = new Connection(this.config.solanaRpcUrl)
+      const connection = new Connection(this.config.solanaRpcUrl, "confirmed")
       const pubkey = new PublicKey(key)
       const watcher = new Watchcore({
         connection,
@@ -96,43 +107,64 @@ export class Watchapi {
         maxSignaturesPerAccount: this.config.maxSignaturesPerAccount,
         minLamportsThreshold: this.config.minLamportsThreshold,
       })
-      watcher.start()
       watcher.handleEvent = (account, event: TransferEvent) => {
         const formatted = formatEventForApi(account.toBase58(), event)
         eventStore.add(formatted)
       }
-      this.watchers.set(key, watcher)
+      watcher.start()
+      watchers.set(key, watcher)
+      logger.info("Started watcher", { account: key })
       res.json({ message: `Started watching ${key}` })
-    } catch (err) {
-      res.status(500).json({ error: (err as Error).message })
+    } catch (err: any) {
+      logger.error("Failed to start watcher", { account: key, error: err.message })
+      res.status(500).json({ error: err.message })
     }
   }
 
-  private async handleStopWatch(req: Request, res: Response): Promise<void> {
-    try {
-      const { account } = req.body
-      const key = account as string
-      const watcher = this.watchers.get(key)
-      if (!watcher) {
-        res.status(404).json({ error: `No watcher for ${key}` })
-        return
-      }
-      watcher.stop()
-      this.watchers.delete(key)
-      res.json({ message: `Stopped watching ${key}` })
-    } catch (err) {
-      res.status(500).json({ error: (err as Error).message })
+  private async handleStopWatch(req: Request, res: Response) {
+    const parsed = WatchRequestSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.errors.map(e => e.message) })
     }
+    const key = parsed.data.account
+    const watcher = watchers.get(key)
+    if (!watcher) {
+      return res.status(404).json({ error: `No watcher for ${key}` })
+    }
+    watcher.stop()
+    watchers.delete(key)
+    logger.info("Stopped watcher", { account: key })
+    res.json({ message: `Stopped watching ${key}` })
   }
 
-  private handleGetEvents(req: Request, res: Response): void {
-    const since = Number(req.query.since) || 0
+  private async handleGetEvents(req: Request, res: Response) {
+    const parsed = EventsQuerySchema.safeParse(req.query)
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.errors.map(e => e.message) })
+    }
+    const since = parsed.data.since
     const events = eventStore.getSince(since)
     res.json({ events })
   }
+
+  /** Wrapper to catch and forward async errors */
+  private wrap(fn: (req: Request, res: Response) => Promise<void>) {
+    return (req: Request, res: Response, next: NextFunction) => {
+      fn(req, res).catch(next)
+    }
+  }
+
+  /** Central error handler */
+  private errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors.map(e => e.message) })
+    } else {
+      logger.error("Unhandled error", { error: err.message })
+      res.status(500).json({ error: "Internal server error" })
+    }
+  }
 }
 
-// instantiate and run server if this module is entrypoint
 if (require.main === module) {
   const api = new Watchapi({ solanaRpcUrl: "https://api.mainnet-beta.solana.com" })
   api.start()
