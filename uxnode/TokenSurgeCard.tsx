@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useMemo } from 'react'
 
 interface TokenSurgeCardProps {
   name: string
@@ -8,32 +8,54 @@ interface TokenSurgeCardProps {
   onClick?: () => void
 }
 
-export const TokenSurgeCard: React.FC<TokenSurgeCardProps> = ({
+export const TokenSurgeCard: React.FC<TokenSurgeCardProps> = React.memo(({
   name,
   symbol,
   surgePercent,
   timestamp,
   onClick,
 }) => {
-  const date = new Date(timestamp).toLocaleString()
+  const dateString = useMemo(
+    () => new Date(timestamp).toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }),
+    [timestamp]
+  )
 
-  const trendClass = surgePercent >= 0 ? 'text-green-600' : 'text-red-600'
-  const arrow = surgePercent >= 0 ? '▲' : '▼'
+  const isPositive = surgePercent >= 0
+  const trendClass = isPositive ? 'text-green-600' : 'text-red-600'
+  const arrow = isPositive ? '▲' : '▼'
+  const absPercent = Math.abs(surgePercent).toFixed(1)
 
   return (
-    <div
-      className="border rounded-2xl p-4 shadow-lg hover:shadow-xl cursor-pointer transition"
+    <button
       onClick={onClick}
+      disabled={!onClick}
+      aria-label={`${name} (${symbol}) surged ${absPercent}% as of ${dateString}`}
+      className={`
+        w-full text-left border rounded-2xl p-4 shadow-lg 
+        hover:shadow-xl focus:shadow-xl transition 
+        focus:outline-none focus:ring-2 focus:ring-offset-2 
+        focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-default
+      `}
     >
       <header className="flex justify-between items-center mb-2">
         <h3 className="text-xl font-semibold">
-          {name} <span className="text-sm opacity-75">({symbol})</span>
+          {name}{' '}
+          <span className="text-sm text-gray-400">({symbol})</span>
         </h3>
         <span className={`font-bold ${trendClass}`}>
-          {arrow} {Math.abs(surgePercent).toFixed(1)}%
+          {arrow} {absPercent}%
         </span>
       </header>
-      <p className="text-sm text-gray-500">As of {date}</p>
-    </div>
+      <p className="text-sm text-gray-500">As of {dateString}</p>
+    </button>
   )
-}
+})
+
+TokenSurgeCard.displayName = 'TokenSurgeCard'
+ 
