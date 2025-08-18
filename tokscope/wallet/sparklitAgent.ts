@@ -1,47 +1,71 @@
-import { SparklitAPIClient } from './sparklitServices'
-import { SurgeDetectionService } from './sparklitServices'
+import { SparklitAPIClient, SurgeDetectionService } from './sparklitServices'
 import type { VaultMetric } from '../cryptureVaultTypes'
 
 /**
- * SparklitAgent: high-level orchestrator for Sparklit project
- *
- * Combines API client and detection service to provide actionable insights
+ * Orchestrator for fetching and analyzing vault data for a given token.
  */
 export class SparklitAgent {
-  private apiClient: SparklitAPIClient
-  private detector: SurgeDetectionService
+  private readonly apiClient: SparklitAPIClient
+  private readonly detector: SurgeDetectionService
 
-  constructor(baseUrl: string, apiKey: string, thresholdPercent = 15) {
+  constructor(
+    baseUrl: string,
+    apiKey: string,
+    thresholdPercent: number = 15
+  ) {
+    if (!baseUrl || !apiKey) {
+      throw new Error("SparklitAgent requires a base URL and API key.")
+    }
+
+    if (thresholdPercent < 1 || thresholdPercent > 100) {
+      throw new RangeError("thresholdPercent must be between 1 and 100")
+    }
+
     this.apiClient = new SparklitAPIClient(baseUrl, apiKey)
     this.detector = new SurgeDetectionService(thresholdPercent)
   }
 
   /**
-   * Retrieves and analyzes vault metrics for surge events
-   * @param tokenAddress - SPL token mint address
-   * @param periodHours - Lookback window in hours
-   * @returns Promise resolving to timestamps of detected surges
+   * Detects significant surges in vault volume for a token
    */
   async getVolumeSurges(tokenAddress: string, periodHours: number): Promise<number[]> {
-    const metrics: VaultMetric[] = await this.apiClient.fetchVaultMetrics(tokenAddress, periodHours)
+    const metrics = await this.fetchValidatedMetrics(tokenAddress, periodHours)
     return this.detector.detectVolumeSurges(metrics)
   }
 
   /**
-   * Retrieves and analyzes vault metrics for liquidity dips
-   * @param tokenAddress - SPL token mint address
-   * @param periodHours - Lookback window in hours
-   * @returns Promise resolving to timestamps of detected dips
+   * Detects significant dips in liquidity for a token
    */
   async getLiquidityDips(tokenAddress: string, periodHours: number): Promise<number[]> {
-    const metrics: VaultMetric[] = await this.apiClient.fetchVaultMetrics(tokenAddress, periodHours)
+    const metrics = await this.fetchValidatedMetrics(tokenAddress, periodHours)
     return this.detector.detectLiquidityDips(metrics)
   }
 
   /**
-   * Fetches raw metrics for custom analyses
+   * Exposes raw metrics for external analytics
    */
   async fetchRawMetrics(tokenAddress: string, periodHours: number): Promise<VaultMetric[]> {
-    return this.apiClient.fetchVaultMetrics(tokenAddress, periodHours)
+    return this.fetchValidatedMetrics(tokenAddress, periodHours)
   }
-}
+
+  /**
+   * Allows metric-based surge analysis (e.g., TVL, collateral ratio)
+   */
+  async analyzeSurgesByMetric(
+    tokenAddress: string,
+    periodHours: number,
+    metricKey: keyof VaultMetric
+  ): Promise<number[]> {
+    const metrics = await this.fetchValidatedMetrics(tokenAddress, periodHours)
+    return this.detector.detectSurgeOnMetric(metrics, metricKey)
+  }
+
+  /**
+   * Internal helper to fetch and validate inputs
+   */
+  private async fetchValidatedMetrics(
+    tokenAddress: string,
+    periodHours: number
+  ): Promise<VaultMetric[]> {
+    if (!tokenAddress || typeof tokenAddress !== 'string') {
+      throw new TypeError("tokenAddress mu
