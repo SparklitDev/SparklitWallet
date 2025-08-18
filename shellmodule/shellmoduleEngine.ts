@@ -1,15 +1,13 @@
-// ShellmoduleEngine.ts
-
 import fetch, { RequestInit } from 'node-fetch'
 import { z } from 'zod'
 import type { VaultMetric } from '../cryptureVaultTypes'
 
-// Zod schema for VaultMetric (adjust fields to match your type)
+// zod schema to validate API response
 const VaultMetricSchema = z.object({
   timestamp: z.number().int(),
   totalValueLocked: z.number(),
   collateralRatio: z.number(),
-  // add other fields from VaultMetric as needed…
+  // Extend with other VaultMetric fields if needed
 })
 
 const SnapshotsResponseSchema = z.object({
@@ -17,10 +15,8 @@ const SnapshotsResponseSchema = z.object({
 })
 
 export interface ShellmoduleEngineOptions {
-  /** Number of retry attempts on failure (default: 2) */
-  retries?: number
-  /** Request timeout in milliseconds (default: 8000) */
-  timeoutMs?: number
+  retries?: number      // Number of retries on failure
+  timeoutMs?: number    // Per-request timeout
 }
 
 export class ShellmoduleEngine {
@@ -29,79 +25,77 @@ export class ShellmoduleEngine {
   private readonly retries: number
   private readonly timeoutMs: number
 
-  constructor(
-    apiUrl: string,
-    apiKey: string,
-    opts: ShellmoduleEngineOptions = {}
-  ) {
+  constructor(apiUrl: string, apiKey: string, options: ShellmoduleEngineOptions = {}) {
     this.apiUrl = apiUrl.replace(/\/+$/, '')
     this.apiKey = apiKey
-    this.retries = opts.retries ?? 2
-    this.timeoutMs = opts.timeoutMs ?? 8000
+    this.retries = options.retries ?? 2
+    this.timeoutMs = options.timeoutMs ?? 8000
 
     if (this.retries < 0 || !Number.isInteger(this.retries)) {
-      throw new RangeError(`retries must be a non-negative integer, got ${opts.retries}`)
+      throw new RangeError(`"retries" must be a non-negative integer (got ${options.retries})`)
     }
+
     if (this.timeoutMs <= 0 || !Number.isInteger(this.timeoutMs)) {
-      throw new RangeError(`timeoutMs must be a positive integer, got ${opts.timeoutMs}`)
+      throw new RangeError(`"timeoutMs" must be a positive integer (got ${options.timeoutMs})`)
     }
   }
 
   private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
     const controller = new AbortController()
-    const id = setTimeout(() => controller.abort(), this.timeoutMs)
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs)
+
     try {
       return await fetch(url, { ...init, signal: controller.signal })
     } finally {
-      clearTimeout(id)
+      clearTimeout(timeoutId)
     }
   }
 
   /**
-   * Fetches snapshot metrics for a given contract address
-   * @param contractAddress - On-chain contract address
-   * @param limit - Number of snapshots to retrieve
+   * Fetch snapshot metrics for a specific contract.
    */
-  public async fetchSnapshots(
-    contractAddress: string,
-    limit: number = 50
-  ): Promise<VaultMetric[]> {
-    if (typeof contractAddress !== 'string' || !contractAddress) {
-      throw new TypeError('contractAddress must be a non-empty string')
+  public async fetchSnapshots(contractAddress: string, limit: number = 50): Promise<VaultMetric[]> {
+    if (!contractAddress || typeof contractAddress !== 'string') {
+      throw new TypeError("contractAddress must be a non-empty string")
     }
+
     if (!Number.isInteger(limit) || limit < 1) {
-      throw new RangeError(`limit must be a positive integer, got ${limit}`)
+      throw new RangeError(`limit must be a positive integer (got ${limit})`)
     }
 
-    const url = `${this.apiUrl}/shellmodule/snapshots?address=${encodeURIComponent(
-      contractAddress
-    )}&limit=${limit}`
+    const url = `${this.apiUrl}/shellmodule/snapshots?address=${encodeURIComponent(contractAddress)}&limit=${limit}`
 
-    let lastError: any
+    let lastError: Error | null = null
+
     for (let attempt = 0; attempt <= this.retries; attempt++) {
       try {
-        const res = await this.fetchWithTimeout(url, {
-          headers: { Authorization: `Bearer ${this.apiKey}` },
+        const response = await this.fetchWithTimeout(url, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            Accept: 'application/json',
+          },
         })
-        if (!res.ok) {
-          const text = await res.text().catch(() => res.statusText)
-          throw new Error(`HTTP ${res.status}: ${text}`)
+
+        if (!response.ok) {
+          const bodyText = await response.text().catch(() => '')
+          throw new Error(`HTTP ${response.status}: ${bodyText || response.statusText}`)
         }
-        const data = await res.json()
-        const parsed = SnapshotsResponseSchema.parse(data)
-        return parsed.snapshots as VaultMetric[]
+
+        const json = await response.json()
+        const validated = SnapshotsResponseSchema.parse(json)
+        return validated.snapshots as VaultMetric[]
       } catch (err: any) {
         lastError = err
-        // retry on server errors or timeout
-        if (
+
+        const shouldRetry =
           err.name === 'AbortError' ||
-          (err.message?.startsWith('HTTP') && res?.status >= 500)
-        ) {
-          continue
-        }
-        break
+          (typeof err.message === 'string' && /^HTTP 5\d{2}/.test(err.message))
+
+        if (!shouldRetry || attempt === this.retries) break
       }
     }
-    throw new Error(`Failed to fetch snapshots after ${this.retries + 1} attempts: ${lastError.message}`)
+
+    throw new Error(`❌ Failed to fetch snapshots after ${this.retries + 1} attempt(s): ${lastError?.message || 'Unknown error'}`)
   }
 }
